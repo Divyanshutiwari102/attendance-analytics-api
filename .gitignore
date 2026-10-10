@@ -1,0 +1,27 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Test data dumps
+sample_data/
+*.log
+
+# Local tests
+local_tests/
+
+# Claude
+.claude/
+
+# Problem statement and related files (keep locally, don't commit)
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_seed.py
+CLAUDE.md
+.env.example
