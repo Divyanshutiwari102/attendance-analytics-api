@@ -20,6 +20,8 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import random
 import time
+import calendar
+import re
 from contextlib import asynccontextmanager
 
 load_dotenv()
@@ -224,6 +226,33 @@ def derive_fields(emp, status, punch_in_dt, punch_out_dt, date_str):
     ot = compute_overtime(punch_out_dt, emp["shift_start"], emp["shift_end"], date_str)
     half = work < 4.5  # work is already rounded to 2 decimals half-up
     return late, work, ot, half
+
+
+# Helper to compute working days in a month given joined_on
+def compute_working_days(joined_on_str: str, year: int, month: int) -> int:
+    """Return number of Mon-Fri days in the month, counting from joined_on if joined during the month."""
+    # If joined_on is after the month, return 0
+    try:
+        joined_on = date.fromisoformat(joined_on_str)
+    except ValueError:
+        # Should not happen if joined_on is valid
+        return 0
+    # First and last day of the month
+    first_day = date(year, month, 1)
+    last_day = date(year, month, calendar.monthrange(year, month)[1])
+    if joined_on > last_day:
+        return 0
+    # Start counting from the later of joined_on and first_day
+    start = joined_on if joined_on > first_day else first_day
+    # Iterate through the days from start to last_day, count Mon-Fri
+    days = 0
+    current = start
+    while current <= last_day:
+        if current.weekday() < 5:  # Monday is 0, Friday is 4
+            days += 1
+        current += timedelta(days=1)
+    return days
+
 
 
 # --------------------------------------------------------------------------- #
@@ -664,6 +693,98 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
 
     # If we reach here, all attempts failed
     raise HTTPException(status_code=409, detail="Could not update record due to conflict")
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str):
+    # Validate month format
+    if not re.match(r'^\d{4}-(0[1-9]|1[0-2])$', month):
+        raise HTTPException(status_code=422, detail="Invalid month format. Expected YYYY-MM")
+    # Check employee exists
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="emp_code not found")
+    # Parse year and month
+    year, month_num = map(int, month.split('-'))
+    # First and last day of the month as strings YYYY-MM-DD
+    first_day = f"{year:04d}-{month_num:02d}-01"
+    last_day = f"{year:04d}-{month_num:02d}-{calendar.monthrange(year, month_num)[1]:02d}"
+    # MongoDB aggregation
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {
+                    "$gte": first_day,
+                    "$lte": last_day
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]
+                    }
+                },
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "total_overtime_minutes": {"$sum": "$overtime_minutes"},
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 2]},
+                                    {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 6]}
+                                ]
+                            },
+                            {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]},
+                            0
+                        ]
+                    }
+                }
+            }
+        }
+    ]
+    result = list(db.attendance_logs.aggregate(pipeline))
+    if not result:
+        # No records for the month
+        agg = {}
+    else:
+        agg = result[0]
+    # Compute working days using helper
+    working_days = compute_working_days(emp["joined_on"], year, month_num)
+    present_days = agg.get("present_days", 0)
+    # Ensure present_days is float (could be int if no half days)
+    present_days = float(present_days)
+    leave_days = agg.get("leave_days", 0)
+    late_count = agg.get("late_count", 0)
+    total_late_minutes = agg.get("total_late_minutes", 0)
+    total_overtime_minutes = agg.get("total_overtime_minutes", 0)
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        attendance_pct = (present_days / working_days) * 100
+        # Round to 2 decimals half-up using Decimal
+        attendance_pct = float(Decimal(str(attendance_pct)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct
+    }
 
 
 # --------------------------------------------------------------------------- #
