@@ -18,6 +18,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, StrictInt
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
+import random
+import time
 from contextlib import asynccontextmanager
 
 load_dotenv()
@@ -32,6 +34,7 @@ async def lifespan(app: FastAPI):
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("date", -1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     yield
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -56,8 +59,6 @@ def to_ist(dt: datetime) -> datetime:
 
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
-
-
 
 
 # --------------------------------------------------------------------------- #
@@ -211,6 +212,20 @@ def attendance_date(punch_in_dt: datetime, shift_start: str, shift_end: str) -> 
     return attendance_dt.isoformat()
 
 
+def derive_fields(emp, status, punch_in_dt, punch_out_dt, date_str):
+    """Return (late_minutes, work_hours, overtime_minutes, half_day) per R2-R5."""
+    if status in ("ABSENT", "LEAVE") or punch_in_dt is None:
+        return 0, None, 0, False
+    # we have a punch_in
+    late = compute_late_minutes(punch_in_dt, emp["shift_start"], emp["shift_end"])
+    if punch_out_dt is None:
+        return late, None, 0, False
+    work = compute_work_hours(punch_in_dt, punch_out_dt)
+    ot = compute_overtime(punch_out_dt, emp["shift_start"], emp["shift_end"], date_str)
+    half = work < 4.5  # work is already rounded to 2 decimals half-up
+    return late, work, ot, half
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -232,6 +247,19 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[StrictInt] = Field(None, strict=True, ge=100000000000, le=4102444800000)
     status: str = Field(default="PRESENT", pattern='^(PRESENT|WFH|ON_DUTY)$')
+
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(None, strict=True, ge=100000000000, le=4102444800000)
+
+
+class RegularizeRequest(BaseModel):
+    status: Optional[str] = Field(None, pattern='^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$')
+    punch_in: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
@@ -312,6 +340,99 @@ def punch_in(body: PunchInIn):
     return doc
 
 
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="emp_code not found")
+
+    ts = ms_to_dt(body.punched_at) if body.punched_at else datetime.now(tz=timezone.utc)
+    # Truncate to whole seconds (R1)
+    ts = ts.replace(microsecond=0)
+
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        # Find the most recent record for this employee with punch_in <= ts
+        # This needs to work across midnight for overnight shifts
+        current = db.attendance_logs.find_one(
+            {
+                "emp_code": emp["emp_code"],
+                "punch_in": {"$lte": ts}
+            },
+            sort=[("punch_in", -1)]  # Most recent first
+        )
+
+        if current is None:
+            raise HTTPException(status_code=404, detail="No punch-in found for this employee")
+
+        # Truncate instants to whole seconds (R1)
+        punch_in_dt = current["punch_in"]
+        # punch_in_dt is already a datetime from MongoDB, ensure it has no microseconds
+        punch_in_dt = punch_in_dt.replace(microsecond=0)
+
+        # If already punched out, return 409
+        if current.get("punch_out") is not None:
+            raise HTTPException(status_code=409, detail="Record already punched out")
+
+        # Validate punched_at is after punch_in
+        if ts <= punch_in_dt:
+            raise HTTPException(status_code=422, detail="punched_at must be after punch_in")
+
+        # Validate punched_at is not more than 24 hours after punch_in
+        if ts > punch_in_dt + timedelta(hours=24):
+            raise HTTPException(status_code=422, detail="punched_at more than 24 hours after punch_in")
+
+        # Compute derived fields
+        # For punch-out, we keep the existing status unless it's being changed via regularize
+        # But for a pure punch-out, status remains as it was
+        new_status = current.get("status")
+        new_punch_in = punch_in_dt  # Keep existing punch_in
+        new_punch_out = ts          # Set punch_out to the provided time
+
+        # Compute attendance date from the punch_in (this should match the record's date)
+        date_str = attendance_date(punch_in_dt, emp["shift_start"], emp["shift_end"])
+
+        late_minutes, work_hours, overtime_minutes, half_day = derive_fields(
+            emp, new_status, new_punch_in, new_punch_out, date_str
+        )
+
+        # Prepare update document
+        update = {
+            "punch_out": new_punch_out,
+            "work_hours": work_hours,
+            "overtime_minutes": overtime_minutes,
+            "half_day": half_day,
+        }
+
+        # Build match filter: guard on _id and current state of the fields we are about to update
+        match_filter = {
+            "_id": current["_id"],
+            "punch_in": current.get("punch_in"),
+            "punch_out": current.get("punch_out"),
+        }
+        # For history, we can match on length and existence (but punch-out doesn't modify history)
+        if "history" in current:
+            match_filter["history"] = {"$size": len(current["history"])}
+        else:
+            match_filter["history"] = {"$exists": False}
+
+        result = db.attendance_logs.update_one(match_filter, {"$set": update})
+        if result.modified_count == 1:
+            # Success
+            updated_doc = db.attendance_logs.find_one({"_id": current["_id"]})
+            updated_doc.pop("_id", None)
+            if updated_doc.get("punch_in") is not None:
+                updated_doc["punch_in"] = dt_to_ms(updated_doc["punch_in"])
+            if updated_doc.get("punch_out") is not None:
+                updated_doc["punch_out"] = dt_to_ms(updated_doc["punch_out"])
+            return updated_doc
+        # else retry after a tiny random sleep
+        time.sleep(random.uniform(0, 0.02))
+
+    # If we reach here, all attempts failed
+    raise HTTPException(status_code=409, detail="Could not update record due to conflict")
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -390,9 +511,163 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    # Validate date format
+    try:
+        date = validate_iso_date_string(date)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="emp_code not found")
+
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        # Read the record fresh
+        current = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+        if current is None:
+            raise HTTPException(status_code=404, detail="Record not found")
+
+        # Truncate instants to whole seconds (R1)
+        punch_in_dt = ms_to_dt(body.punch_in) if body.punch_in else None
+        if punch_in_dt is not None:
+            punch_in_dt = punch_in_dt.replace(microsecond=0)
+        punch_out_dt = ms_to_dt(body.punch_out) if body.punch_out else None
+        if punch_out_dt is not None:
+            punch_out_dt = punch_out_dt.replace(microsecond=0)
+
+        # Build new state from existing values and supplied fields
+        new_status = body.status if body.status is not None else current.get("status")
+        new_punch_in = punch_in_dt if body.punch_in is not None else current.get("punch_in")
+        new_punch_out = punch_out_dt if body.punch_out is not None else current.get("punch_out")
+
+        # Validation rules
+        if new_status in ("ABSENT", "LEAVE"):
+            if body.punch_in is not None or body.punch_out is not None:
+                raise HTTPException(status_code=422, detail="ABSENT/LEAVE cannot have punch times")
+            # ABSENT/LEAVE clears punch times
+            new_punch_in = None
+            new_punch_out = None
+        else:
+            # Presence status requires a punch_in
+            if new_status in ("PRESENT", "WFH", "ON_DUTY") and new_punch_in is None:
+                raise HTTPException(status_code=422, detail="Presence status requires punch_in")
+            # punch_in must belong to the record's date (R1)
+            if new_punch_in is not None:
+                # Compute attendance date from punch_in_dt and employee shift
+                att_date = attendance_date(new_punch_in, emp["shift_start"], emp["shift_end"])
+                if att_date != date:
+                    raise HTTPException(status_code=422, detail="punch_in does not belong to the record's date")
+            # punch_out must be after punch_in and within 24 hours
+            if new_punch_in is not None and new_punch_out is not None:
+                if new_punch_out <= new_punch_in:
+                    raise HTTPException(status_code=422, detail="punch_out must be after punch_in")
+                if new_punch_out > new_punch_in + timedelta(hours=24):
+                    raise HTTPException(status_code=422, detail="punch_out more than 24 hours after punch_in")
+
+        # Compute derived fields
+        late_minutes, work_hours, overtime_minutes, half_day = derive_fields(emp, new_status, new_punch_in, new_punch_out, date)
+
+        # Prepare update document
+        update = {}
+        if body.status is not None:
+            update["status"] = new_status
+        update["punch_in"] = new_punch_in
+        update["punch_out"] = new_punch_out
+        # Derived fields are always updated (they may have changed due to punch time changes)
+        update["work_hours"] = work_hours
+        update["late_minutes"] = late_minutes
+        update["overtime_minutes"] = overtime_minutes
+        update["half_day"] = half_day
+
+        # Build changes history
+        changes = {}
+        # status
+        if body.status is not None and body.status != current.get("status"):
+            changes["status"] = {"from": current.get("status"), "to": new_status}
+        # punch_in
+        from_val = current.get("punch_in")
+        to_val = new_punch_in
+        if from_val != to_val:
+            changes["punch_in"] = {"from": dt_to_ms(from_val) if from_val is not None else None,
+                                   "to": dt_to_ms(to_val) if to_val is not None else None}
+        # punch_out
+        from_val = current.get("punch_out")
+        to_val = new_punch_out
+        if from_val != to_val:
+            changes["punch_out"] = {"from": dt_to_ms(from_val) if from_val is not None else None,
+                                    "to": dt_to_ms(to_val) if to_val is not None else None}
+        # work_hours
+        if "work_hours" in update:
+            from_val = current.get("work_hours")
+            to_val = work_hours
+            if from_val != to_val:
+                changes["work_hours"] = {"from": from_val, "to": to_val}
+        # late_minutes
+        if "late_minutes" in update:
+            from_val = current.get("late_minutes", 0)
+            to_val = late_minutes
+            if from_val != to_val:
+                changes["late_minutes"] = {"from": from_val, "to": to_val}
+        # overtime_minutes
+        if "overtime_minutes" in update:
+            from_val = current.get("overtime_minutes", 0)
+            to_val = overtime_minutes
+            if from_val != to_val:
+                changes["overtime_minutes"] = {"from": from_val, "to": to_val}
+        # half_day
+        if "half_day" in update:
+            from_val = current.get("half_day", False)
+            to_val = half_day
+            if from_val != to_val:
+                changes["half_day"] = {"from": from_val, "to": to_val}
+
+        if not changes:
+            raise HTTPException(status_code=422, detail="No changes to apply")
+
+        # Prepare history entry
+        history_entry = {
+            "at": dt_to_ms(datetime.now(tz=timezone.utc)),
+            "by": body.regularized_by,
+            "reason": body.reason,
+            "changes": changes
+        }
+
+        # Build match filter: guard on _id and current state of the fields we are about to update (except history)
+        match_filter = {
+            "_id": current["_id"],
+            "status": current.get("status"),
+            "punch_in": current.get("punch_in"),
+            "punch_out": current.get("punch_out"),
+        }
+        # For history, we can match on length and existence
+        if "history" in current:
+            match_filter["history"] = {"$size": len(current["history"])}
+        else:
+            match_filter["history"] = {"$exists": False}
+
+        update_with_history = {"$set": update, "$push": {"history": history_entry}}
+        result = db.attendance_logs.update_one(match_filter, update_with_history)
+        if result.modified_count == 1:
+            # Success
+            updated_doc = db.attendance_logs.find_one({"_id": current["_id"]})
+            updated_doc.pop("_id", None)
+            if updated_doc.get("punch_in") is not None:
+                updated_doc["punch_in"] = dt_to_ms(updated_doc["punch_in"])
+            if updated_doc.get("punch_out") is not None:
+                updated_doc["punch_out"] = dt_to_ms(updated_doc["punch_out"])
+            return updated_doc
+        # else retry after a tiny random sleep
+        time.sleep(random.uniform(0, 0.02))
+
+    # If we reach here, all attempts failed
+    raise HTTPException(status_code=409, detail="Could not update record due to conflict")
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
