@@ -259,12 +259,12 @@ def compute_working_days(joined_on_str: str, year: int, month: int) -> int:
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str = Field(..., pattern='^EMP\d{4,6}$')
+    emp_code: str = Field(..., pattern=r'^EMP\d{4,6}$')
     name: str = Field(..., min_length=1, max_length=100)
-    email: str = Field(..., max_length=120, pattern='^[^@\s]+@[^@\s]+\.[^@\s]+$')
+    email: str = Field(..., max_length=120, pattern=r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
     department: str = Field(..., min_length=1, max_length=50)
-    shift_start: str = Field(default="09:30", pattern='^([01]\d|2[0-3]):[0-5]\d$')
-    shift_end: str = Field(default="18:30", pattern='^([01]\d|2[0-3]):[0-5]\d$')
+    shift_start: str = Field(default="09:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    shift_end: str = Field(default="18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
     joined_on: str
     @field_validator('joined_on')
     @classmethod
@@ -698,7 +698,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str):
     # Validate month format
-    if not re.match(r'^\d{4}-(0[1-9]|1[0-2])$', month):
+    if not re.fullmatch(r'[0-9]{4}-(0[1-9]|1[0-2])', month):
         raise HTTPException(status_code=422, detail="Invalid month format. Expected YYYY-MM")
     # Check employee exists
     emp = db.employees.find_one({"emp_code": emp_code})
@@ -771,9 +771,8 @@ def employee_monthly(emp_code: str, month: str):
     if working_days == 0:
         attendance_pct = None
     else:
-        attendance_pct = (present_days / working_days) * 100
-        # Round to 2 decimals half-up using Decimal
-        attendance_pct = float(Decimal(str(attendance_pct)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        attendance_pct = (Decimal(str(present_days)) * 100 / Decimal(working_days)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        attendance_pct = float(attendance_pct)
     return {
         "emp_code": emp_code,
         "month": month,
