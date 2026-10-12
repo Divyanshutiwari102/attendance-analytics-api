@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, StrictInt
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
@@ -1053,3 +1053,88 @@ def department_summary(month: str, department: Optional[str] = None):
             )
 
     return {"month": month, "items": results}
+
+
+_DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def parse_day_or_422(value: str) -> datetime:
+    if not _DAY_RE.fullmatch(value):
+        raise HTTPException(status_code=422, detail="Dates must be YYYY-MM-DD")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Not a real calendar date")
+
+
+def round4_half_up(x):
+    if x is None:
+        return None
+    return float(Decimal(str(x)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_date: str = Query(..., alias="from"),
+    to_date: str = Query(..., alias="to"),
+):
+    start = parse_day_or_422(from_date)
+    end = parse_day_or_422(to_date)
+    n_days = (end - start).days + 1
+    if n_days < 1:
+        raise HTTPException(status_code=422, detail="'to' must not be before 'from'")
+    if n_days > 92:
+        raise HTTPException(status_code=422, detail="Range cannot exceed 92 days")
+    if db.employees.count_documents({"department": department}, limit=1) == 0:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    start_utc = start.replace(tzinfo=timezone.utc)
+    present_statuses = ["PRESENT", "WFH", "ON_DUTY"]
+    pipeline = [
+        {"$match": {"department": department}},
+        {"$group": {"_id": None, "codes": {"$push": "$emp_code"}, "joined": {"$push": "$joined_on"}}},
+        {"$project": {"_id": 0, "codes": 1, "joined": 1,
+            "days": {"$map": {"input": {"$range": [0, n_days]}, "as": "i",
+                "in": {"$let": {
+                    "vars": {"dt": {"$dateAdd": {"startDate": start_utc, "unit": "day", "amount": "$$i"}}},
+                    "in": {"d": {"$dateToString": {"format": "%Y-%m-%d", "date": "$$dt"}},
+                           "dow": {"$dayOfWeek": "$$dt"}}}}}}}},
+        {"$unwind": "$days"},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"d": "$days.d", "codes": "$codes"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [{"$eq": ["$date", "$$d"]}, {"$in": ["$emp_code", "$$codes"]}]}}},
+                {"$project": {"_id": 0, "status": 1, "half_day": 1, "late_minutes": 1}},
+            ],
+            "as": "logs"}},
+        {"$addFields": {
+            "date": "$days.d",
+            "is_working_day": {"$and": [{"$gte": ["$days.dow", 2]}, {"$lte": ["$days.dow", 6]}]},
+            "headcount": {"$size": {"$filter": {"input": "$joined", "as": "j", "cond": {"$lte": ["$$j", "$days.d"]}}}},
+            "present_count": {"$sum": {"$map": {"input": "$logs", "as": "l", "in": {
+                "$cond": [{"$in": ["$$l.status", present_statuses]},
+                          {"$cond": [{"$eq": ["$$l.half_day", True]}, 0.5, 1]}, 0]}}}},
+            "late_count": {"$size": {"$filter": {"input": "$logs", "as": "l", "cond": {"$gt": ["$$l.late_minutes", 0]}}}},
+        }},
+        {"$addFields": {"attendance_rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$divide": ["$present_count", "$headcount"]}, None]}}},
+        {"$setWindowFields": {"sortBy": {"date": 1},
+            "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}}},
+        {"$sort": {"date": 1}},
+        {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1,
+                      "late_count": 1, "attendance_rate": 1, "moving_avg_7d": 1}},
+    ]
+    rows = list(db.employees.aggregate(pipeline))
+    items = [{
+        "date": r["date"],
+        "is_working_day": r["is_working_day"],
+        "headcount": r["headcount"],
+        "present_count": float(r["present_count"]),
+        "late_count": r["late_count"],
+        "attendance_rate": round4_half_up(r.get("attendance_rate")),
+        "moving_avg_7d": round4_half_up(r.get("moving_avg_7d")),
+    } for r in rows]
+    return {"department": department, "items": items}
