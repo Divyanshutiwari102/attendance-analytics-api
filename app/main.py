@@ -796,6 +796,112 @@ def employee_monthly(emp_code: str, month: str):
 # --------------------------------------------------------------------------- #
 
 
+@app.get("/analytics/leaderboard/late")
+def leaderboard_late(month: str, limit: int = 10, department: Optional[str] = None):
+    # Validate month format
+    if not re.fullmatch(r'[0-9]{4}-(0[1-9]|1[0-2])', month):
+        raise HTTPException(status_code=422, detail="Invalid month format. Expected YYYY-MM")
+    # Validate limit
+    if limit < 1 or limit > 50:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 50")
+    # Compute first and last day of the month
+    year, month_num = map(int, month.split('-'))
+    first_day = f"{year:04d}-{month_num:02d}-01"
+    last_day = f"{year:04d}-{month_num:02d}-{calendar.monthrange(year, month_num)[1]:02d}"
+
+    # Aggregation pipeline
+    pipeline = [
+        {
+            "$match": {
+                "date": {
+                    "$gte": first_day,
+                    "$lte": last_day
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {
+                    "$sum": {
+                        "$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]
+                    }
+                }
+            }
+        },
+        {
+            "$match": {
+                "total_late_minutes": {"$gt": 0}
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "let": {"emp_code": "$_id"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {"$eq": ["$emp_code", "$$emp_code"]}
+                        }
+                    }
+                ],
+                "as": "employee_info"
+            }
+        },
+        {
+            "$unwind": "$employee_info"
+        }
+    ]
+
+    # Add department filter if provided
+    if department:
+        pipeline.append({"$match": {"employee_info.department": department}})
+
+    pipeline.extend([
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                }
+            }
+        },
+        {
+            "$match": {
+                "rank": {"$lte": limit}
+            }
+        },
+        {
+            "$sort": {
+                "total_late_minutes": -1,
+                "_id": 1   # sort by emp_code ascending
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "rank": "$rank",
+                "emp_code": "$_id",
+                "name": "$employee_info.name",
+                "department": "$employee_info.department",
+                "total_late_minutes": 1,
+                "late_count": 1
+            }
+        }
+    ])
+
+    # Execute aggregation
+    results = list(db.attendance_logs.aggregate(pipeline))
+
+    # Ensure integers
+    for res in results:
+        res["total_late_minutes"] = int(res["total_late_minutes"])
+        res["late_count"] = int(res["late_count"])
+
+    return {"month": month, "items": results}
+
+
 @app.get("/analytics/departments/summary")
 def department_summary(month: str, department: Optional[str] = None):
     # Validate month format
