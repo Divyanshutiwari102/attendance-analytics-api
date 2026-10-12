@@ -946,4 +946,4 @@ def department_summary(month: str, department: Optional[str] = None):
                 Decimal(str(res["avg_work_hours"])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             )
 
-    return results
+    return {"month": month, "items": results}
