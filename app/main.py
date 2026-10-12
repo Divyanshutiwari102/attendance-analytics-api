@@ -254,7 +254,6 @@ def compute_working_days(joined_on_str: str, year: int, month: int) -> int:
     return days
 
 
-
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -795,3 +794,156 @@ def employee_monthly(emp_code: str, month: str):
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str, department: Optional[str] = None):
+    # Validate month format
+    if not re.fullmatch(r'[0-9]{4}-(0[1-9]|1[0-2])', month):
+        raise HTTPException(status_code=422, detail="Invalid month format. Expected YYYY-MM")
+    # Parse year and month
+    year, month_num = map(int, month.split('-'))
+    # First and last day of the month as strings YYYY-MM-DD
+    first_day = f"{year:04d}-{month_num:02d}-01"
+    last_day = f"{year:04d}-{month_num:02d}-{calendar.monthrange(year, month_num)[1]:02d}"
+
+    # Match employees: joined_on <= last_day and optional department filter
+    emp_match = {"joined_on": {"$lte": last_day}}
+    if department:
+        emp_match["department"] = department
+
+    # Lookup attendance logs for the month
+    lookup_pipeline = [
+        {
+            "$match": {
+                "$expr": {
+                    "$and": [
+                        {"$eq": ["$emp_code", "$$emp_code"]},
+                        {"$gte": ["$date", first_day]},
+                        {"$lte": ["$date", last_day]}
+                    ]
+                }
+            }
+        }
+    ]
+
+    # Aggregation pipeline starting from employees
+    pipeline = [
+        {"$match": emp_match},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"emp_code": "$emp_code"},
+                "pipeline": lookup_pipeline,
+                "as": "logs"
+            }
+        },
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {
+            "$group": {
+                "_id": {
+                    "department": "$department",
+                    "emp_code": "$emp_code"
+                },
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$logs.date"}}}, 2]},
+                                    {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$logs.date"}}}, 6]}
+                                ]
+                            },
+                            {"$cond": [{"$eq": ["$logs.half_day", True]}, 0.5, 1]},
+                            0
+                        ]
+                    }
+                },
+                "total_work_hours": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$ne": ["$logs.work_hours", None]}
+                                ]
+                            },
+                            "$logs.work_hours",
+                            0
+                        ]
+                    }
+                },
+                "count_work_hours": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$ne": ["$logs.work_hours", None]}
+                                ]
+                            },
+                            1,
+                            0
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {"$cond": [{"$gt": ["$logs.late_minutes", 0]}, 1, 0]}
+                },
+                "total_late_minutes": {"$sum": "$logs.late_minutes"},
+                "leave_count": {
+                    "$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}
+                },
+                "on_duty_count": {
+                    "$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.department",
+                "headcount": {"$sum": 1},
+                "present_days": {"$sum": "$present_days"},
+                "total_work_hours": {"$sum": "$total_work_hours"},
+                "count_work_hours": {"$sum": "$count_work_hours"},
+                "late_count": {"$sum": "$late_count"},
+                "total_late_minutes": {"$sum": "$total_late_minutes"},
+                "leave_count": {"$sum": "$leave_count"},
+                "on_duty_count": {"$sum": "$on_duty_count"}
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "department": "$_id",
+                "headcount": 1,
+                "present_days": 1,
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": ["$count_work_hours", 0]},
+                        {"$divide": ["$total_work_hours", "$count_work_hours"]},
+                        None
+                    ]
+                },
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1
+            }
+        },
+        {"$sort": {"department": 1}}
+    ]
+
+    # Execute aggregation
+    results = list(db.employees.aggregate(pipeline))
+
+    # Post-process: round avg_work_hours to 2 decimals half-up using Decimal
+    for res in results:
+        if res["avg_work_hours"] is not None:
+            # Convert to string to avoid floating point issues, then quantize
+            res["avg_work_hours"] = float(
+                Decimal(str(res["avg_work_hours"])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            )
+
+    return results
