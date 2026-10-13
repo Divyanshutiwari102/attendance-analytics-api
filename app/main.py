@@ -917,6 +917,11 @@ def department_summary(month: str, department: Optional[str] = None):
     emp_match = {"joined_on": {"$lte": last_day}}
     if department:
         emp_match["department"] = department
+    else:
+        # department is required on every employee, so this keeps the same rows
+        # but lets MongoDB walk the (department, emp_code) index instead of
+        # scanning the whole collection.
+        emp_match["department"] = {"$exists": True}
 
     # Lookup attendance logs for the month
     lookup_pipeline = [
@@ -1138,3 +1143,187 @@ def department_trend(
         "moving_avg_7d": round4_half_up(r.get("moving_avg_7d")),
     } for r in rows]
     return {"department": department, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# Part C: GET /admin/explain/{endpoint}
+#
+# The explain must describe the query the endpoint REALLY runs. So instead of
+# writing the queries a second time, we call the real endpoint function while
+# `db` is in "capture mode": find()/aggregate() are recorded (not executed),
+# and the recorded query is then sent to MongoDB wrapped in `explain`.
+# Normal requests are not affected: capture mode is off unless this endpoint
+# turned it on for the current request.
+# ---------------------------------------------------------------------------
+import asyncio
+from typing import Any
+import contextvars
+import inspect
+import json
+from typing import Literal
+
+from bson import json_util
+from fastapi import Request
+from fastapi.params import Param
+from pydantic import TypeAdapter, ValidationError
+from pymongo.collection import Collection
+
+_real_db = db
+_capture = contextvars.ContextVar("explain_capture", default=None)
+
+
+class _CapturingCursor:
+    def __init__(self, spec):
+        self._spec = spec
+
+    def sort(self, key_or_list, direction=None):
+        if isinstance(key_or_list, str):
+            self._spec["sort"] = {key_or_list: 1 if direction is None else direction}
+        else:
+            self._spec["sort"] = dict(key_or_list)
+        return self
+
+    def skip(self, n):
+        self._spec["skip"] = int(n)
+        return self
+
+    def limit(self, n):
+        self._spec["limit"] = int(n)
+        return self
+
+    def hint(self, h):
+        self._spec["hint"] = h if isinstance(h, str) else dict(h)
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+
+class _CapturingCollection:
+    def __init__(self, coll):
+        self._coll = coll
+
+    def find(self, filter=None, projection=None, *args, **kwargs):
+        store = _capture.get()
+        if store is None:
+            return self._coll.find(filter, projection, *args, **kwargs)
+        spec = {"kind": "find", "collection": self._coll.name, "filter": filter or {}}
+        if projection:
+            spec["projection"] = projection
+        store.append(spec)
+        return _CapturingCursor(spec)
+
+    def aggregate(self, pipeline, *args, **kwargs):
+        store = _capture.get()
+        if store is None:
+            return self._coll.aggregate(pipeline, *args, **kwargs)
+        store.append({"kind": "aggregate", "collection": self._coll.name, "pipeline": list(pipeline)})
+        return []
+
+    def __getattr__(self, name):
+        return getattr(self._coll, name)
+
+
+class _CapturingDatabase:
+    def __init__(self, database):
+        self._database = database
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        attr = getattr(self._database, name)
+        return _CapturingCollection(attr) if isinstance(attr, Collection) else attr
+
+    def __getitem__(self, name):
+        return _CapturingCollection(self._database[name])
+
+
+db = _CapturingDatabase(_real_db)
+
+_EXPLAIN_ROUTES = {
+    "attendance_list": "/attendance",
+    "employee_monthly": "/analytics/employees/{emp_code}/monthly",
+    "department_summary": "/analytics/departments/summary",
+    "late_leaderboard": "/analytics/leaderboard/late",
+    "department_trend": "/analytics/departments/{department}/trend",
+}
+
+
+def _find_route_function(path: str):
+    for route in app.routes:
+        if getattr(route, "path", None) == path and "GET" in (getattr(route, "methods", None) or ()):
+            return route.endpoint
+    raise HTTPException(status_code=500, detail="Endpoint function not found")
+
+
+def _build_kwargs(fn, query) -> dict:
+    kwargs = {}
+    for name, param in inspect.signature(fn, eval_str=True).parameters.items():
+        d = param.default
+        key = name
+        required = False
+        default = d
+        if d is inspect.Parameter.empty:
+            required = True
+            default = None
+        elif isinstance(d, Param):
+            key = d.alias or name
+            default = d.default
+            required = default is Ellipsis or type(default).__name__ == "PydanticUndefinedType"
+            if required:
+                default = None
+        raw = query.get(key)
+        if raw is None:
+            if required:
+                raise HTTPException(status_code=422, detail=f"Missing query parameter: {key}")
+            kwargs[name] = default
+            continue
+        annotation = Any if param.annotation is inspect.Parameter.empty else param.annotation
+        try:
+            kwargs[name] = TypeAdapter(annotation).validate_python(raw)
+        except ValidationError:
+            raise HTTPException(status_code=422, detail=f"Invalid value for query parameter: {key}")
+    return kwargs
+
+
+@app.get("/admin/explain/{endpoint}")
+def admin_explain(
+    endpoint: Literal[
+        "attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"
+    ],
+    request: Request,
+):
+    fn = _find_route_function(_EXPLAIN_ROUTES[endpoint])
+    kwargs = _build_kwargs(fn, request.query_params)
+
+    store = []
+    token = _capture.set(store)
+    try:
+        try:
+            if inspect.iscoroutinefunction(fn):
+                asyncio.run(fn(**kwargs))
+            else:
+                fn(**kwargs)
+        except Exception:
+            # Errors before the main query (bad month, unknown employee...) are real
+            # errors for the caller. Errors after it only come from the empty fake result.
+            if not store:
+                raise
+    finally:
+        _capture.reset(token)
+
+    if not store:
+        raise HTTPException(status_code=500, detail="No database query was captured")
+    main = store[-1]
+
+    if main["kind"] == "find":
+        cmd = {"find": main["collection"], "filter": main["filter"]}
+        for k in ("projection", "sort", "skip", "limit", "hint"):
+            if k in main:
+                cmd[k] = main[k]
+    else:
+        cmd = {"aggregate": main["collection"], "pipeline": main["pipeline"], "cursor": {}}
+
+    raw = _real_db.command({"explain": cmd, "verbosity": "executionStats"})
+    explain = json.loads(json_util.dumps(raw, json_options=json_util.RELAXED_JSON_OPTIONS))
+    return {"endpoint": endpoint, "collection": main["collection"], "explain": explain}
