@@ -18,8 +18,21 @@ Needs Python 3.11+ and MongoDB 6.0+ (for example `docker run -p 27017:27017 mong
 
 Real environment variables take priority over a local `.env`. Indexes are created at startup and are safe to re-run.
 
+## Endpoints
+
+- `GET /health`
+- `POST /employees`, `GET /employees`
+- `POST /attendance/punch-in`, `POST /attendance/punch-out`
+- `GET /attendance`
+- `PATCH /attendance/{emp_code}/{date}` (manual correction, saved in the record's history)
+- `GET /analytics/employees/{emp_code}/monthly`
+- `GET /analytics/departments/summary`
+- `GET /analytics/leaderboard/late`
+- `GET /analytics/departments/{department}/trend`
+- `GET /admin/explain/{endpoint}` (MongoDB `explain` for the real query behind an endpoint)
+
 ## Notes
 
 - Dates are IST; times in the API are epoch milliseconds.
-- `GET /admin/explain/{endpoint}` runs MongoDB `explain` on the real query behind an endpoint.
+- Duplicate punch-ins and duplicate employees are stopped by unique indexes, so parallel requests are safe.
 - Design choices are in `DECISIONS.md`; the review of the starter code is in `REVIEW.md`.
